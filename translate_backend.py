@@ -4,7 +4,7 @@ from typing import Optional, List
 from argostranslate import package, translate
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(APP_DIR, "vendor", "argos_models")
+MODEL_DIR = os.path.join(APP_DIR, "translatePacks", "argos_models")
 
 def _ensure_models_installed():
     if os.path.isdir(MODEL_DIR):
