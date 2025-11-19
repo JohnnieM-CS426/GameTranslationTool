@@ -77,7 +77,9 @@ class PreviewWidget(QtWidgets.QLabel):
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
         if self.qimage is not None:
+            # Draw base image
             target = self.rect()
             pix = QtGui.QPixmap.fromImage(self.qimage)
             painter.drawPixmap(target, pix, pix.rect())
@@ -86,34 +88,53 @@ class PreviewWidget(QtWidgets.QLabel):
             scale_x = target.width() / max(1, src_w)
             scale_y = target.height() / max(1, src_h)
 
-            text_bg = QtGui.QColor(0, 0, 0, 160)
-            painter.setPen(QtGui.QPen(QtGui.QColor(255, 215, 0, 230), 2))
-            painter.setBrush(text_bg)
-
             for e in self.overlay_entries:
                 x, y, w, h = e["bbox"]
-                tx, ty, tw, th = int(x * scale_x), int(y * scale_y), int(w * scale_x), int(h * scale_y)
+                tx, ty = int(x * scale_x), int(y * scale_y)
 
-                painter.drawRect(QtCore.QRect(tx, ty, max(60, tw), max(24, h)))
                 txt = e.get("translation") or e.get("text") or ""
 
+                # ---- Set font ----
                 font = painter.font()
-                font.setPointSize(max(10, int(h * 0.6)))
+                font.setPointSize(13)
                 painter.setFont(font)
+                metrics = QtGui.QFontMetrics(font)
+
+                # ---- Set max width for text ----
+                max_width = int(target.width() * 0.6)
+                text_rect = metrics.boundingRect(
+                    0, 0,
+                    max_width,
+                    9999,
+                    QtCore.Qt.TextWordWrap,
+                    txt
+                )
+
+                box_w = text_rect.width() + 12
+                box_h = text_rect.height() + 12
+
+                # ---- Draw background box (auto-sized) ----
+                painter.setPen(QtGui.QPen(QtGui.QColor(255, 215, 0, 230), 2))
+                painter.setBrush(QtGui.QColor(0, 0, 0, 160))
+                painter.drawRect(QtCore.QRect(tx, ty, box_w, box_h))
+
+                # ---- Draw text inside ----
+                text_area = QtCore.QRect(tx + 6, ty + 6, text_rect.width(), text_rect.height())
                 painter.setPen(QtGui.QColor(255, 255, 0))
                 painter.drawText(
-                    QtCore.QRect(tx + 4, ty + 2, max(60, tw) - 8, max(24, h) - 4),
-                    QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
-                    txt,
+                    text_area,
+                    QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop | QtCore.Qt.TextWordWrap,
+                    txt
                 )
+
         painter.end()
 
-
 class MainWindow(QtWidgets.QWidget):
+    translate_signal = QtCore.Signal(str, str, str)
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Game Translation Tool (OCR + Textractor)")
-        self.resize(1280, 820)
+        self.translate_signal.connect(self.translate_and_update)
 
         root = QtWidgets.QHBoxLayout(self)
 
@@ -353,7 +374,8 @@ class MainWindow(QtWidgets.QWidget):
             for e in self.latest_ocr:
                 txt = e["text"]
                 try:
-                    trans = translate_text(src_lang, dst_lang, txt)
+                    self.translate_signal.emit(src_lang, dst_lang, txt)
+                    trans = self.last_translation
                 except Exception:
                     trans = txt
                 overlay.append({
@@ -414,6 +436,10 @@ class MainWindow(QtWidgets.QWidget):
     def closeEvent(self, e):
         self.stop_worker()
         return super().closeEvent(e)
+
+    def translate_and_update(self, src, dst, txt):
+        trans = translate_text(src, dst, txt)
+        self.last_translation = trans
 
 
 if __name__ == "__main__":

@@ -1,53 +1,49 @@
+import requests
+import html
+import urllib.parse
 
-import os
-from typing import Optional, List
-from argostranslate import package, translate
+GOOGLE_TRANSLATE_URL = "https://translate.google.com/m"
+_translation_cache = {}
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(APP_DIR, "translatePacks", "argos_models")
+LANG_MAP = {
+    "auto": "auto",
+    "zh": "zh-CN",
+    "en": "en",
+    "ja": "ja",
+}
 
-def _ensure_models_installed():
-    if os.path.isdir(MODEL_DIR):
-        for fn in os.listdir(MODEL_DIR):
-            if fn.lower().endswith(".argosmodel"):
-                try:
-                    package.install_from_path(os.path.join(MODEL_DIR, fn))
-                except Exception:
-                    pass
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+}
 
-def _get_lang(lang_code: str):
-    langs = translate.get_installed_languages()
-    for l in langs:
-        if l.code.lower().startswith(lang_code.lower()):
-            return l
-    return None
+def google_translate(text, src="auto", dst="en"):
+    if not text.strip():
+        return ""
 
-def available_pair(src_code: str, dst_code: str):
-    src = _get_lang(src_code); dst = _get_lang(dst_code)
-    if not src or not dst: return None
-    for t in src.translations:
-        if t.from_lang.code == src.code and t.to_lang.code == dst.code:
-            return t
-    return None
+    src = LANG_MAP.get(src.lower(), src)
+    dst = LANG_MAP.get(dst.lower(), dst)
 
-def translate_text(src_code: str, dst_code: str, text: str) -> str:
-    if not text: return ""
-    _ensure_models_installed()
-    if src_code == "auto":
-        for ch in text:
-            if '぀' <= ch <= 'ヿ':
-                src_code = "ja"; break
-            if '一' <= ch <= '鿿':
-                src_code = "zh"; break
-        else:
-            src_code = "en"
-    direct = available_pair(src_code, dst_code)
-    if direct:
-        return direct.translate(text)
-    if src_code != "en" and dst_code != "en":
-        to_en = available_pair(src_code, "en")
-        en_to_dst = available_pair("en", dst_code)
-        if to_en and en_to_dst:
-            mid = to_en.translate(text)
-            return en_to_dst.translate(mid)
-    return text
+    params = {"sl": src, "tl": dst, "q": text}
+    url = GOOGLE_TRANSLATE_URL + "?" + urllib.parse.urlencode(params)
+
+    r = requests.get(url, headers=headers, timeout=5)
+    if r.status_code != 200:
+        return text
+
+    content = r.text
+    try:
+        start = content.index('result-container">') + 18
+        end = content.index("<", start)
+        return html.unescape(content[start:end])
+    except:
+        return text
+
+
+def translate_text(src_lang, dst_lang, text):
+    key = f"{src_lang}|{dst_lang}|{text}"
+    if key in _translation_cache:
+        return _translation_cache[key]
+
+    result = google_translate(text, src_lang, dst_lang)
+    _translation_cache[key] = result
+    return result

@@ -13,11 +13,6 @@ _last_debug_save = 0.0
 
 
 def ocr_image_data(pil_image, prefer_lang_code="auto"):
-    """
-    输入:  PIL.Image (RGB)
-    输出:  [{'text': str, 'bbox': (x, y, w, h), 'lang': 'unknown'}, ...]
-    兼容原来 EasyOCR 版本的返回格式
-    """
     global _last_debug_save
 
     now = time.time()
