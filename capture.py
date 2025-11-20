@@ -37,9 +37,10 @@ class WindowLister:
                 for window in window_list:
                     windowid = window['kCGWindowNumber']
                     title = window.get('kCGWindowName', '')
+                    pid = window.get('kCGWindowOwnerPID', None)
                     #filter to keep visible windows only
-                    if title and windowid:
-                        result.append((windowid, title))
+                    if title and pid:
+                        result.append((pid, title))
                 return result
             except Exception:
                 print("Not installed")#used for debugging

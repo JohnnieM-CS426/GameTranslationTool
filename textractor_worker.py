@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import subprocess
 import ctypes
@@ -11,13 +12,20 @@ TEXTRACTOR_CLI_PATH = os.path.join(APP_DIR, "TextractorCLI.exe")
 
 def get_pid_from_hwnd(hwnd: int) -> int:
     """Return process ID for a given window handle (HWND)."""
-    pid = ctypes.c_ulong()
-    ctypes.windll.user32.GetWindowThreadProcessId(
-        ctypes.c_void_p(hwnd),
-        ctypes.byref(pid)
+    if sys.platform == "win32":
+        import ctypes
+        pid = ctypes.c_ulong()
+        ctypes.windll.user32.GetWindowThreadProcessId(
+            ctypes.c_void_p(hwnd),
+            ctypes.byref(pid)
     )
-    return pid.value
-
+        return pid.value
+    elif sys.platform == "darwin":
+            # macOS implementation (not implemented here)
+            print("[TEXTRACTOR] get_pid_from_hwnd not implemented on macOS")
+            return None
+    else:
+            return None
 
 class TextractorWorker(QtCore.QThread):
     """Runs TextractorCLI.exe, attaches to a process, emits hooked text lines."""

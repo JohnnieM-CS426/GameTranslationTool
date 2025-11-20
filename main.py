@@ -3,9 +3,12 @@ from PySide6 import QtWidgets, QtCore, QtGui
 
 from capture import WindowLister, capture_window_image
 from ocr_backend import ocr_image_data
-from translate_backend import translate_text
-from textractor_worker import TextractorWorker, get_pid_from_hwnd
-from text_overlay import TextOverlay
+from translate_backend import translate_text, LANG_MAP
+#from textractor_worker import TextractorWorker, get_pid_from_hwnd
+
+from frida_worker import TextractorWorker 
+from textractor_worker import get_pid_from_hwnd
+
 
 APP_DIR = os.path.dirname(__file__)
 TRANSLATION_FILE = os.path.join(APP_DIR, "translations.json")
@@ -183,10 +186,11 @@ class MainWindow(QtWidgets.QWidget):
         lang_row = QtWidgets.QHBoxLayout()
         self.src_combo = QtWidgets.QComboBox()
         self.dst_combo = QtWidgets.QComboBox()
-        for code in ["auto", "zh", "en", "ja"]:
-            self.src_combo.addItem(LANG_LABELS[code], userData=code)
-        for code in ["zh", "en", "ja"]:
-            self.dst_combo.addItem(LANG_LABELS[code], userData=code)
+        for code, label in LANG_MAP.items():
+            self.src_combo.addItem(label, userData=code)
+        #for code in ["zh", "en", "ja"]:
+            #self.dst_combo.addItem(LANG_LABELS[code], userData=code)
+            self.dst_combo.addItem(LANG_MAP.get(code, code), userData=code)
         self.src_combo.setCurrentIndex(0)
         self.dst_combo.setCurrentIndex(1)
         lang_row.addWidget(QtWidgets.QLabel("From (OCR+Trans)"))
@@ -346,17 +350,37 @@ class MainWindow(QtWidgets.QWidget):
         if self.textractor_worker:
             self.textractor_worker.stop()
             self.textractor_worker = None
-
-        pid = get_pid_from_hwnd(self.attached_hwnd)
+        pid = None
+        
+        """pid = get_pid_from_hwnd(self.attached_hwnd)
         if not pid:
             self.status.setText("Failed to get process ID for window.")
+            return"""
+
+        if sys.platform.startswith("win"):
+            pid = get_pid_from_hwnd(self.attached_hwnd)
+            if not pid:
+                self.status.setText("Failed to get process ID for window.")
+                return
+            
+            self.textractor_worker = TextractorWorker(pid)
+            self.textractor_worker.text_ready.connect(self.on_hook_text)
+            self.textractor_worker.start()
+            self.status.setText(f"Textractor hook started (PID {pid}).")
+        
+    
+        elif sys.platform.startswith("darwin"):
+            pid = self.attached_hwnd  
+            self.textractor_worker = TextractorWorker(pid)
+            self.textractor_worker.text_ready.connect(self.on_hook_text)
+            self.textractor_worker.start()
+            self.status.setText(f"Frida hook started (PID {pid}).")
             return
-
-        self.textractor_worker = TextractorWorker(pid)
-        self.textractor_worker.text_ready.connect(self.on_hook_text)
-        self.textractor_worker.start()
-        self.status.setText(f"Textractor hook started (PID {pid}).")
-
+        
+        else:
+            self.status.setText("Unsupported platform for Textractor.")
+            return
+            
     def stop_textractor(self):
         if self.textractor_worker:
             self.textractor_worker.stop()
