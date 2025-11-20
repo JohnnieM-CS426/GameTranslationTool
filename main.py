@@ -190,17 +190,26 @@ class MainWindow(QtWidgets.QWidget):
 
         self.ocr_table = QtWidgets.QTableWidget(0, 4)
         self.ocr_table.setHorizontalHeaderLabels(["Source Text", "Lang", "Translation", "BBox/Source"])
-        self.ocr_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        #self.ocr_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        #right.addWidget(self.ocr_table, 1)
+        header = self.ocr_table.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)  
         right.addWidget(self.ocr_table, 1)
-
+        
         self.edit = QtWidgets.QPlainTextEdit()
         right.addWidget(self.edit)
 
         buttons = QtWidgets.QHBoxLayout()
         self.apply_btn = QtWidgets.QPushButton("Apply to selected")
         self.save_btn = QtWidgets.QPushButton("Save Translations")
+        self.help_btn = QtWidgets.QPushButton("Help")
         buttons.addWidget(self.apply_btn)
         buttons.addWidget(self.save_btn)
+        buttons.addWidget(self.help_btn)
+        
         right.addLayout(buttons)
 
         splitL = QtWidgets.QWidget()
@@ -233,6 +242,7 @@ class MainWindow(QtWidgets.QWidget):
         self.ocr_table.itemSelectionChanged.connect(self.on_select)
         self.apply_btn.clicked.connect(self.apply_translation)
         self.save_btn.clicked.connect(self.save_translations)
+        self.help_btn.clicked.connect(self.help_bar)
         self.src_combo.currentIndexChanged.connect(self.on_src_lang_changed)
 
         self.refresh_windows()
@@ -255,7 +265,25 @@ class MainWindow(QtWidgets.QWidget):
             self.start_worker()
         if self.hook_mode_chk.isChecked():
             self.start_textractor()
-
+            
+    def help_bar(self):
+        text = """
+        Game Translation Tool Help:
+        - Click "Refresh Windows" from the top bar to list all available windows.
+        - Select a window from the dropdown and click "Attach" to connect.
+        - Enable "Real-time OCR" to start capturing and OCRing the window content.
+        - Enable "Use Textractor hook" to extract text using Textractor.
+        - Adjust frame and OCR intervals using the spin boxes.
+        - Use the language dropdowns to set source and target languages for translation.
+        - Select OCR results from the table to view and edit translations.
+        - Click "Apply to selected" to save edits to the selected OCR result.
+        - Click "Save Translations" to save all translations to a JSON file.
+        
+        For more information, refer to the documentation or visit the project repository.
+"""
+        QtWidgets.QMessageBox.information(self, "Help", text)
+    
+    
     def start_worker(self):
         if not self.attached_hwnd:
             self.status.setText("No window attached.")
