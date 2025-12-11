@@ -3,13 +3,16 @@ from PySide6 import QtCore
 
 
 class TextractorWorker(QtCore.QThread):
-    #Runs Frida to hook text rendering functions, emits hooked text lines.
+    """
+    A worker thread that uses Frida for dynamic instrumentation.
+    Frida allows injecting JavaScript into a running process to hook function calls (like text rendering).
+    """
+    # Runs Frida to hook text rendering functions, emits hooked text lines.
     text_ready = QtCore.Signal(str)
     
     def __init__(self, pid: int, parent=None):
         """
-        Initializes the Frida based text hook worker for a given process id.
-        It stores the pid, sets up internal session and script references, and prepares the QThread for later execution.
+        Initializes the Frida session with the target Process ID (PID).
         """
         super().__init__(parent)
         self.pid = pid
@@ -19,13 +22,16 @@ class TextractorWorker(QtCore.QThread):
     
     def run(self):
         """
-        Attaches Frida to the target process and starts the instrumentation script.
-        It loads the JavaScript code, hooks text related functions, enters a message loop, and keeps running while the worker is marked as active.
+        Main execution: attaches to the process, injects the JS script, and listens for messages.
         """
         self._running = True
-#start frida session and script
+# start frida session and script
         try:
+            # Principle: Frida attaches to the target process memory space.
             self._session = frida.attach(self.pid)
+            
+            # The JavaScript code defines what functions to hook inside the target process.
+            # (The code below is a placeholder template).
             js = """
             // Frida JavaScript code to hook text rendering functions
             // This is a placeholder; actual implementation depends on the target application
@@ -34,6 +40,7 @@ class TextractorWorker(QtCore.QThread):
             };
             """
             
+            # Create and load the script into the target process.
             self._script = self._session.create_script(js)
             self._script.on("message", self.on_message)
             self._script.load()
@@ -45,21 +52,20 @@ class TextractorWorker(QtCore.QThread):
         while self._running:
             QtCore.QThread.msleep(100)
             
-#handle messages from frida script
+# handle messages from frida script
     def on_message(self, message, data):
         """
-        Handles messages sent from the injected Frida script.
-        It filters for messages that contain captured text payloads and emits them through the text_ready Qt signal so the UI can display them.
+        Callback triggered when the injected JS script calls send().
+        It parses the payload and emits the text to the UI.
         """
         if message['type'] == 'send':
             text = message['payload']
             self.text_ready.emit(text)
             
-#stop the frida session and script
+# stop the frida session and script
     def stop(self):
         """
-        Stops the Frida worker and cleans up the injected script and session.
-        It marks the worker as not running, tries to unload the script and detach the session, and waits for the QThread to finish.
+        Cleanly detaches the Frida session and unloads scripts to prevent game crashes.
         """
         self._running = False
         

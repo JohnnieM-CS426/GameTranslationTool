@@ -2,6 +2,7 @@ import requests
 import html
 import urllib.parse
 
+# We use the mobile version of Google Translate as the API endpoint because it's simpler to scrape.
 GOOGLE_TRANSLATE_URL = "https://translate.google.com/m"
 _translation_cache = {}
 
@@ -77,8 +78,8 @@ headers = {
 
 def google_translate(text, src="auto", dst="en"):
     """
-    Sends the given text to the Google Translate mobile web endpoint and parses the response.
-    It builds a query URL, fetches the HTML, extracts the translated string from specific tags, and safely falls back when parsing fails.
+    Sends a request to Google Translate to translate text.
+    It scrapes the result from the HTML response of the mobile translation page.
     """
     if not text.strip():
         return ""
@@ -86,6 +87,7 @@ def google_translate(text, src="auto", dst="en"):
     src = src.lower()
     dst = dst.lower()
     
+    # Principle: Construct a GET request with source language (sl), target language (tl), and query (q).
     params = {"sl": src, "tl": dst, "q": text}
     url = GOOGLE_TRANSLATE_URL + "?" + urllib.parse.urlencode(params)
 
@@ -94,6 +96,8 @@ def google_translate(text, src="auto", dst="en"):
         return text
 
     content = r.text
+    # Principle: Parse the HTML. The result is typically inside a div with class 'result-container'.
+    # We find the start and end of this tag to extract the translation.
     try:
         start = content.index('result-container">') + 18
         end = content.index("<", start)
@@ -104,8 +108,8 @@ def google_translate(text, src="auto", dst="en"):
 
 def translate_text(src_lang, dst_lang, text):
     """
-    Provides a cached translation helper between two language codes.
-    It looks up the text in an in memory cache and only calls google_translate when there is no cached result, storing the new translation afterward.
+    A wrapper around the translation function that adds caching.
+    This prevents repeated network requests for the same text (common in games).
     """
     key = f"{src_lang}|{dst_lang}|{text}"
     if key in _translation_cache:

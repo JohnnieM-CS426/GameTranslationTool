@@ -1,13 +1,27 @@
-import sys, os, json, time
+"""
+Main application for the GameTranslationTool with Luna hook support.
+
+This module provides a Qt GUI that allows the user to attach to a
+running visual novel window, perform OCR on the live game screen,
+translate the extracted text, and display the results.  It also
+provides an injection mode powered by LunaTranslate's native hook.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import json
+import time
+from typing import List, Dict, Any, Optional
+
 from PySide6 import QtWidgets, QtCore, QtGui
 
 from capture import WindowLister, capture_window_image
 from ocr_backend import ocr_image_data
 from translate_backend import translate_text, LANG_MAP
-#from textractor_worker import TextractorWorker, get_pid_from_hwnd
-
-from frida_worker import TextractorWorker 
-from textractor_worker import get_pid_from_hwnd
+from luna_worker import LunaWorker
+from textractor_worker import get_pid_from_hwnd  # reuse PID lookup
 
 
 APP_DIR = os.path.dirname(__file__)
@@ -15,31 +29,33 @@ TRANSLATION_FILE = os.path.join(APP_DIR, "translations.json")
 LOG_DIR = os.path.join(APP_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-LANG_LABELS = {"auto": "Auto", "zh": "Chinese", "en": "English", "ja": "Japanese"}
-
 
 class CaptureWorker(QtCore.QThread):
-    frame_ready = QtCore.Signal(object)
-    ocr_ready = QtCore.Signal(list)
-    prefer_lang = "auto"
+    """
+    Background thread that captures screen frames and runs OCR periodically.
+    It separates the heavy image processing from the UI thread to prevent freezing.
+    """
 
-    def __init__(self, hwnd, interval_ms=120, ocr_every_ms=1200,
+    frame_ready = QtCore.Signal(object) # Emits the raw image for preview.
+    ocr_ready = QtCore.Signal(list)     # Emits the list of text found by OCR.
+    prefer_lang: str = "auto"
+
+    def __init__(self, hwnd: int, interval_ms: int = 120, ocr_every_ms: int = 1200,
+                 enable_ocr: bool = True, parent: Optional[QtCore.QObject] = None) -> None:
         """
-        Sets up the background capture worker with a target window, capture interval, and OCR interval.
-        It stores these parameters, converts milliseconds to seconds, and initializes state flags controlling whether OCR is enabled.
+        Configures the capture timings.
+        'interval_ms' is how often we capture the screen (FPS). 'ocr_every_ms' is how often we scan text.
         """
-                 enable_ocr=True, parent=None):
         super().__init__(parent)
         self.hwnd = hwnd
-        self.interval = max(60, int(interval_ms)) / 1000.0
-        self.ocr_interval = max(500, int(ocr_every_ms)) / 1000.0
+        self.interval = max(5, int(interval_ms)) / 1000.0
+        self.ocr_interval = max(100, int(ocr_every_ms)) / 1000.0
         self.enable_ocr = enable_ocr
         self._running = False
 
-    def run(self):
+    def run(self) -> None:
         """
-        Runs the capture loop that periodically grabs frames from the game window.
-        It emits each new frame via a signal and, at a slower rate, runs OCR on the current frame and emits the text results when enabled.
+        The main loop. captures image -> emits image -> checks if enough time passed -> runs OCR.
         """
         self._running = True
         last_ocr = 0.0
@@ -48,7 +64,7 @@ class CaptureWorker(QtCore.QThread):
             img = capture_window_image(self.hwnd)
             if img is not None:
                 self.frame_ready.emit(img)
-
+                # Principle: Throttle OCR because it is CPU intensive. We don't need to OCR every frame.
                 if self.enable_ocr and (start - last_ocr) >= self.ocr_interval:
                     try:
                         data = ocr_image_data(img, self.prefer_lang)
@@ -56,135 +72,166 @@ class CaptureWorker(QtCore.QThread):
                     except Exception as e:
                         print("[OCR ERROR]", e)
                     last_ocr = start
-
+            # Sleep for the remainder of the frame interval to maintain stable FPS.
             dt = time.time() - start
             sleep_t = self.interval - dt
             if sleep_t > 0:
                 time.sleep(sleep_t)
 
-    def stop(self):
-        """
-        Requests the capture thread to stop running.
-        It sets the internal running flag to False and waits briefly for the loop to exit cleanly.
-        """
+    def stop(self) -> None:
+        """Stops the thread safely."""
         self._running = False
         self.wait(2000)
 
 
-class PreviewWidget(QtWidgets.QLabel):
-    def __init__(self, parent=None):
-        """
-        Configures the preview widget that displays the captured game image and text overlays.
-        It initializes the stored QImage, overlay entries list, and default text color used when painting.
-        """
+class PreviewWidget(QtWidgets.QWidget):
+    """
+    A custom widget that renders the captured game frame and draws translated text on top.
+    It overrides paintEvent to handle custom graphics drawing.
+    """
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
-        self.setMinimumSize(720, 405)
-        self.setScaledContents(True)
-        self.qimage = None
-        self.overlay_entries = []
-        self.setStyleSheet("background-color: #202225; border-radius: 8px;")
+        self.qimage: Optional[QtGui.QImage] = None
+        self.overlay_entries: List[Dict[str, Any]] = []
+        self.selected_bbox: Optional[tuple[int, int, int, int]] = None
         self.text_overlay_color = QtGui.QColor(255, 255, 0)
-        
-    def update_frame(self, pil_img):
+        self.setMinimumSize(480, 270)
+        self.setStyleSheet("background-color: #202225; border-radius: 8px;")
+
+    def sizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(640, 360)
+
+    def update_frame(self, pil_img) -> None:
         """
-        Updates the preview with the latest captured frame.
-        It converts a PIL image into a QImage, stores it, and triggers a repaint so the new frame appears in the widget.
+        Receives a PIL image, converts it to QImage, and triggers a repaint.
+        Qt cannot display PIL images directly, so raw byte conversion is necessary.
         """
-        data = pil_img.tobytes("raw", "RGB")
+        if pil_img is None:
+            return
+        pil_img = pil_img.convert("RGB")
         w, h = pil_img.size
+        data = pil_img.tobytes("raw", "RGB")
+        # Format_RGB888 ensures correct color mapping from the raw bytes.
         self.qimage = QtGui.QImage(data, w, h, QtGui.QImage.Format.Format_RGB888)
         self.update()
 
-    def update_overlay(self, entries):
-        """
-        Replaces the current overlay entries with a new list of OCR or translated texts.
-        It stores the entries and requests a repaint so bounding boxes and text are redrawn on top of the image.
-        """
-        self.overlay_entries = entries
+    def update_overlay(self, entries: List[Dict[str, Any]]) -> None:
+        """Updates the list of text blocks to draw over the image."""
+        self.overlay_entries = entries or []
         self.update()
-        
-    def setTextColor(self, color: QtGui.QColor):
-        """
-        Changes the color used for drawing overlay text and boxes.
-        It saves the new QColor and triggers a repaint so subsequent draws use the updated style.
-        """
+
+    def setTextColor(self, color: QtGui.QColor) -> None:
         self.text_overlay_color = color
         self.update()
-    
-    def paintEvent(self, event):
+
+    def set_selected_bbox(self, bbox: Optional[tuple[int, int, int, int]]) -> None:
+        self.selected_bbox = bbox
+        self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         """
-        Custom paints the preview by drawing the scaled background image and all overlay items.
-        It computes scale factors between the original capture size and widget size, then draws rectangles and text at the correctly transformed positions.
+        The core rendering logic.
+        1. Draws the game screenshot.
+        2. Calculates scaling ratios (UI size vs Image size).
+        3. Draws semi-transparent boxes and translated text over the original text.
         """
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        
-        if self.qimage is not None:
-            # Draw base image
-            target = self.rect()
-            pix = QtGui.QPixmap.fromImage(self.qimage)
-            painter.drawPixmap(target, pix, pix.rect())
 
-            src_w, src_h = self.qimage.width(), self.qimage.height()
-            scale_x = target.width() / max(1, src_w)
-            scale_y = target.height() / max(1, src_h)
+        # Draw base image or fill background
+        if self.qimage is not None and not self.qimage.isNull():
+            target_rect = self.rect()
+            src_rect = self.qimage.rect()
+            painter.drawImage(target_rect, self.qimage, src_rect)
+        else:
+            painter.fillRect(self.rect(), QtGui.QColor(32, 34, 37))
 
-            for e in self.overlay_entries:
-                x, y, w, h = e["bbox"]
-                tx, ty = int(x * scale_x), int(y * scale_y)
+        # Highlight selected bbox (user selection from table)
+        if self.selected_bbox:
+            x, y, w, h = self.selected_bbox
+            painter.setPen(QtGui.QPen(QtGui.QColor(0, 255, 0), 2))
+            painter.drawRect(x, y, w, h)
 
-                txt = e.get("translation") or e.get("text") or ""
+        # Draw overlay text
+        if not self.overlay_entries or self.qimage is None:
+            painter.end()
+            return
 
-                # ---- Set font ----
-                font = painter.font()
-                font.setPointSize(13)
-                painter.setFont(font)
-                metrics = QtGui.QFontMetrics(font)
+        src_w, src_h = self.qimage.width(), self.qimage.height()
+        tgt_rect = self.rect()
+        # Principle: Calculate scale factor to map image coordinates to widget coordinates.
+        scale_x = tgt_rect.width() / max(1, src_w)
+        scale_y = tgt_rect.height() / max(1, src_h)
 
-                # ---- Set max width for text ----
-                max_width = int(target.width() * 0.6)
-                text_rect = metrics.boundingRect(
-                    0, 0,
-                    max_width,
-                    9999,
-                    QtCore.Qt.TextWordWrap,
-                    txt
-                )
+        painter.setPen(self.text_overlay_color)
+        font = painter.font()
+        font.setPointSize(max(font.pointSize(), 10))
+        painter.setFont(font)
+        metrics = QtGui.QFontMetrics(font)
 
-                box_w = text_rect.width() + 12
-                box_h = text_rect.height() + 12
-
-                # ---- Draw background box (auto-sized) ----
-                #painter.setPen(QtGui.QPen(QtGui.QColor(255, 215, 0, 230), 2))
-                painter.setPen(QtCore.Qt.NoPen)
-                painter.setBrush(QtGui.QColor(0, 0, 0, 160))
-                painter.drawRect(QtCore.QRect(tx, ty, box_w, box_h))
-
-                # ---- Draw text inside ----
-                text_area = QtCore.QRect(tx + 6, ty + 6, text_rect.width(), text_rect.height())
-                painter.setPen(self.text_overlay_color)
-                painter.drawText(
-                    text_area,
-                     QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop | QtCore.Qt.TextWordWrap,
-                    txt
-                )
+        for e in self.overlay_entries:
+            bbox = e.get("bbox")
+            text = e.get("translation") or e.get("text") or ""
+            if not bbox or not text:
+                continue
+            x, y, w, h = bbox
+            # Transform to target coordinates
+            tx = int(x * scale_x)
+            ty = int(y * scale_y)
+            # Constrain width to 60% of the widget to avoid huge boxes
+            max_w = int(tgt_rect.width() * 0.6)
+            rect = metrics.boundingRect(0, 0, max_w, 1000,
+                                        QtCore.Qt.AlignLeft | QtCore.Qt.TextWordWrap,
+                                        text)
+            box_w = rect.width() + 12
+            box_h = rect.height() + 12
+            # Draw semi‑transparent background for readability
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(QtGui.QColor(0, 0, 0, 160))
+            painter.drawRect(QtCore.QRect(tx, ty, box_w, box_h))
+            # Draw text
+            painter.setPen(self.text_overlay_color)
+            painter.drawText(
+                QtCore.QRect(tx + 6, ty + 6, rect.width(), rect.height()),
+                QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop | QtCore.Qt.TextWordWrap,
+                text,
+            )
 
         painter.end()
 
+
 class MainWindow(QtWidgets.QWidget):
+    """
+    The main application window handling UI layout and logic.
+    Manages tabs (OCR vs Injection), worker threads, and user interactions.
+    """
+
     translate_signal = QtCore.Signal(str, str, str)
 
-    def __init__(self):
-        """
-        Builds the main application window, laying out controls for capture, OCR, translation, and text hooking.
-        It creates widgets, connects signals and slots, loads existing translations, and initializes application state.
-        """
+    def __init__(self) -> None:
         super().__init__()
+        self.setWindowTitle("Game Translation Tool")
+        self.resize(1200, 700)
+
         self.translate_signal.connect(self.translate_and_update)
 
-        root = QtWidgets.QHBoxLayout(self)
+        # Persistent state
+        self.worker: Optional[CaptureWorker] = None
+        self.hook_worker: Optional[LunaWorker] = None
+        self.attached_hwnd: Optional[int] = None
+        self.ocr_results: List[Dict[str, Any]] = []
+        self.latest_ocr: List[Dict[str, Any]] = []
+        self.selected_bbox: Optional[tuple[int, int, int, int]] = None
 
-        left = QtWidgets.QVBoxLayout()
+        # Layouts
+        root = QtWidgets.QHBoxLayout(self)
+        left_col = QtWidgets.QVBoxLayout()
+        right_col = QtWidgets.QVBoxLayout()
+        root.addLayout(left_col, 1)
+        root.addLayout(right_col, 1)
+
+        # Top bar with window selector and attach button
         bar = QtWidgets.QHBoxLayout()
         self.win_list = QtWidgets.QComboBox()
         self.refresh_btn = QtWidgets.QPushButton("Refresh Windows")
@@ -192,440 +239,418 @@ class MainWindow(QtWidgets.QWidget):
         bar.addWidget(self.win_list)
         bar.addWidget(self.refresh_btn)
         bar.addWidget(self.attach_btn)
-        left.addLayout(bar)
+        left_col.addLayout(bar)
 
+        # Tab widget for OCR and Injection
+        self.tabs = QtWidgets.QTabWidget()
+        self.ocr_tab = QtWidgets.QWidget()
+        self.inj_tab = QtWidgets.QWidget()
+        self.tabs.addTab(self.ocr_tab, "OCR")
+        self.tabs.addTab(self.inj_tab, "Injection")
+        left_col.addWidget(self.tabs, 1)
+
+        # OCR tab content
+        ocr_layout = QtWidgets.QVBoxLayout(self.ocr_tab)
         self.preview = PreviewWidget()
-        left.addWidget(self.preview, 1)
-
+        ocr_layout.addWidget(self.preview, 1)
+        # Controls for OCR frequency
         ctrl = QtWidgets.QHBoxLayout()
-        self.realtime_chk = QtWidgets.QCheckBox("Real-time OCR")
-        self.hook_mode_chk = QtWidgets.QCheckBox("Use Textractor hook")
         self.interval_spin = QtWidgets.QSpinBox()
-        self.interval_spin.setRange(60, 2000)
-        self.interval_spin.setValue(120)
+        self.interval_spin.setRange(5, 2000)
+        self.interval_spin.setValue(50)
         self.ocr_spin = QtWidgets.QSpinBox()
-        self.ocr_spin.setRange(500, 5000)
-        self.ocr_spin.setValue(1200)
-
-        ctrl.addWidget(self.realtime_chk)
-        ctrl.addWidget(self.hook_mode_chk)
+        self.ocr_spin.setRange(100, 5000)
+        self.ocr_spin.setValue(300)
         ctrl.addWidget(QtWidgets.QLabel("Frame (ms)"))
         ctrl.addWidget(self.interval_spin)
+        ctrl.addSpacing(20)
         ctrl.addWidget(QtWidgets.QLabel("OCR (ms)"))
         ctrl.addWidget(self.ocr_spin)
-        left.addLayout(ctrl)
+        ctrl.addStretch(1)
+        ocr_layout.addLayout(ctrl)
 
-        self.status = QtWidgets.QLabel("")
-        left.addWidget(self.status)
+        # Injection tab content
+        inj_layout = QtWidgets.QVBoxLayout(self.inj_tab)
+        self.inject_log = QtWidgets.QPlainTextEdit()
+        self.inject_log.setReadOnly(True)
+        self.inject_log.setPlaceholderText(
+            "Injection log. When attached, hooked text and translations will appear here."
+        )
+        mono_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+        self.inject_log.setFont(mono_font)
+        inj_layout.addWidget(self.inject_log, 1)
 
-        right = QtWidgets.QVBoxLayout()
+        # Status label
+        self.status = QtWidgets.QLabel("Ready.")
+        left_col.addWidget(self.status)
+
+        # Right column: language selection and table
+        # Language row
         lang_row = QtWidgets.QHBoxLayout()
         self.src_combo = QtWidgets.QComboBox()
         self.dst_combo = QtWidgets.QComboBox()
+        # Populate language combos
+        # Source includes auto
+        self.src_combo.addItem("Auto", userData="auto")
         for code, label in LANG_MAP.items():
             self.src_combo.addItem(label, userData=code)
-        #for code in ["zh", "en", "ja"]:
-            #self.dst_combo.addItem(LANG_LABELS[code], userData=code)
-            self.dst_combo.addItem(LANG_MAP.get(code, code), userData=code)
-        self.src_combo.setCurrentIndex(0)
-        self.dst_combo.setCurrentIndex(1)
-        lang_row.addWidget(QtWidgets.QLabel("From (OCR+Trans)"))
+        for code, label in LANG_MAP.items():
+            self.dst_combo.addItem(label, userData=code)
+        # Default from auto -> English
+        src_index = self.src_combo.findData("auto")
+        if src_index >= 0:
+            self.src_combo.setCurrentIndex(src_index)
+        dst_index = self.dst_combo.findData("en")
+        if dst_index >= 0:
+            self.dst_combo.setCurrentIndex(dst_index)
+        lang_row.addWidget(QtWidgets.QLabel("From"))
         lang_row.addWidget(self.src_combo)
         lang_row.addWidget(QtWidgets.QLabel("To"))
         lang_row.addWidget(self.dst_combo)
         self.text_color_btn = QtWidgets.QPushButton("Text Color")
         lang_row.addWidget(self.text_color_btn)
-        self.text_color_btn.clicked.connect(self.text_overlay_color)
-        right.addLayout(lang_row)
+        right_col.addLayout(lang_row)
 
-        self.ocr_table = QtWidgets.QTableWidget(0, 4)
-        self.ocr_table.setHorizontalHeaderLabels(["Source Text", "Lang", "Translation", "BBox/Source"])
-        #self.ocr_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
-        #right.addWidget(self.ocr_table, 1)
-        header = self.ocr_table.horizontalHeader()
+        # Results table
+        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels([
+            "Source Text",
+            "Translate",
+            "Translation",
+            "BBox/Source",
+        ])
+        header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
-        header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)  
-        right.addWidget(self.ocr_table, 1)
-        
-        self.edit = QtWidgets.QPlainTextEdit()
-        right.addWidget(self.edit)
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
+        self.table.cellClicked.connect(self.on_row_selected)
+        self.table.itemSelectionChanged.connect(self.on_select)
+        right_col.addWidget(self.table, 1)
 
-        buttons = QtWidgets.QHBoxLayout()
+        # Editor for manual translation edits
+        self.edit = QtWidgets.QPlainTextEdit()
+        right_col.addWidget(self.edit)
+
+        # Buttons row
+        btn_row = QtWidgets.QHBoxLayout()
         self.apply_btn = QtWidgets.QPushButton("Apply to selected")
         self.save_btn = QtWidgets.QPushButton("Save Translations")
         self.help_btn = QtWidgets.QPushButton("Help")
-        buttons.addWidget(self.apply_btn)
-        buttons.addWidget(self.save_btn)
-        buttons.addWidget(self.help_btn)
-        
-        right.addLayout(buttons)
+        btn_row.addWidget(self.apply_btn)
+        btn_row.addWidget(self.save_btn)
+        btn_row.addWidget(self.help_btn)
+        right_col.addLayout(btn_row)
 
-        splitL = QtWidgets.QWidget()
-        splitL.setLayout(left)
-        splitR = QtWidgets.QWidget()
-        splitR.setLayout(right)
-        splitter = QtWidgets.QSplitter()
-        splitter.addWidget(splitL)
-        splitter.addWidget(splitR)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        root.addWidget(splitter)
-
-        self.attached_hwnd = None
-        self.worker = None
-        self.textractor_worker = None
-
-        self.latest_ocr = []
-        self.ocr_results = []
-
-        self.hook_last_text = ""
-        self.hook_last_translation = ""
-
+        # Wire up signals
+        self.text_color_btn.clicked.connect(self.choose_text_overlay_color)
         self.refresh_btn.clicked.connect(self.refresh_windows)
         self.attach_btn.clicked.connect(self.attach_window)
-        self.realtime_chk.stateChanged.connect(self.on_realtime_changed)
-        self.hook_mode_chk.stateChanged.connect(self.on_hook_mode_changed)
         self.interval_spin.valueChanged.connect(self.on_interval_changed)
         self.ocr_spin.valueChanged.connect(self.on_interval_changed)
-        self.ocr_table.itemSelectionChanged.connect(self.on_select)
         self.apply_btn.clicked.connect(self.apply_translation)
         self.save_btn.clicked.connect(self.save_translations)
-        self.help_btn.clicked.connect(self.help_bar)
+        self.help_btn.clicked.connect(self.show_help)
         self.src_combo.currentIndexChanged.connect(self.on_src_lang_changed)
 
+        # Initialize window list
         self.refresh_windows()
 
-    def refresh_windows(self):
+    # ---------------------- Window and attach logic ----------------------
+    def refresh_windows(self) -> None:
         """
-        Refreshes the drop down list of available windows that can be attached.
-        It calls the capture module to list windows and repopulates the combo box with the latest handles and titles.
+        Refreshes the drop-down list of available windows.
+        Calls the WindowLister helper to get current open applications.
         """
         self.win_list.clear()
-        wins = WindowLister.list_windows()
+        try:
+            wins = WindowLister.list_windows()
+        except Exception as e:
+            self.status.setText(f"Failed to list windows: {e}")
+            return
         for hwnd, title in wins:
-            self.win_list.addItem(f"{title} - {hwnd}", userData=hwnd)
-        self.status.setText(f"Found {len(wins)} windows")
+            if not title:
+                continue
+            self.win_list.addItem(title, userData=hwnd)
+        self.status.setText(f"Found {self.win_list.count()} windows.")
 
-    def attach_window(self):
-        """
-        Attaches the tool to the user selected window entry.
-        It resolves the selected handle, stores it as the active target, and updates status text and button states accordingly.
-        """
+    def current_hwnd(self) -> Optional[int]:
+        """Returns the Handle (HWND) of the currently selected window in the dropdown."""
         idx = self.win_list.currentIndex()
         if idx < 0:
-            return
-        self.attached_hwnd = self.win_list.currentData()
-        self.status.setText(f"Attached to window: {self.win_list.currentText()}")
+            return None
+        return self.win_list.currentData()
 
-        if self.realtime_chk.isChecked():
-            self.start_worker()
-        if self.hook_mode_chk.isChecked():
-            self.start_textractor()
-            
-    def help_bar(self):
+    def attach_window(self) -> None:
         """
-        Shows a help or information dialog for the user.
-        It explains how to use key parts of the interface and provides guidance without leaving the program.
+        Attaches the tool to the selected window.
+        Logic splits here: Starts OCR capture if on the OCR tab, or starts memory hooking if on Injection tab.
         """
-        text = """
-        Game Translation Tool Help:
-        - Click "Refresh Windows" from the top bar to list all available windows.
-        - Select a window from the dropdown and click "Attach" to connect.
-        - Enable "Real-time OCR" to start capturing and OCRing the window content.
-        - Enable "Use Textractor hook" to extract text using Textractor.
-        - Adjust frame and OCR intervals using the spin boxes.
-        - Use the language dropdowns to set source and target languages for translation.
-        - Select OCR results from the table to view and edit translations.
-        - Click "Apply to selected" to save edits to the selected OCR result.
-        - Click "Save Translations" to save all translations to a JSON file.
-        
-        For more information, refer to the documentation or visit the project repository.
-"""
-        QtWidgets.QMessageBox.information(self, "Help", text)
-    
-    def text_overlay_color(self):
-        """
-        Opens a color picker so the user can choose a new text overlay color.
-        It updates the PreviewWidget with the selected color and optionally records the choice for future sessions.
-        """
-        color = QtWidgets.QColorDialog.getColor()
-        if color.isValid():
-            self.preview.setTextColor(color)
-    
-    def start_worker(self):
-        """
-        Starts or restarts the CaptureWorker with the current UI settings.
-        It stops any existing worker, creates a new one with the selected intervals and OCR toggle, connects its signals, and starts the thread.
-        """
+        hwnd = self.current_hwnd()
+        if hwnd is None:
+            self.status.setText("No window selected.")
+            return
+        self.attached_hwnd = hwnd
+        current_title = self.win_list.currentText()
+        # Determine which tab we're on
+        if self.tabs.currentIndex() == 0:
+            # OCR tab
+            self.start_capture()
+            self.stop_hook()
+            self.status.setText(f"Attached OCR to window: {current_title}")
+        else:
+            # Injection tab
+            self.start_hook()
+            self.stop_capture()
+            self.status.setText(f"Attached hook to window: {current_title}")
+
+    # ---------------------- Capture / OCR handling ----------------------
+    def start_capture(self) -> None:
+        """Starts the visual capture thread (screen grabbing + OCR)."""
         if not self.attached_hwnd:
-            self.status.setText("No window attached.")
             return
-
-        self.stop_worker()
-
-        enable_ocr = self.realtime_chk.isChecked() and not self.hook_mode_chk.isChecked()
-
+        # Stop existing worker
+        self.stop_capture()
         self.worker = CaptureWorker(
             self.attached_hwnd,
             interval_ms=self.interval_spin.value(),
             ocr_every_ms=self.ocr_spin.value(),
-            enable_ocr=enable_ocr,
+            enable_ocr=True,
         )
         self.worker.prefer_lang = self.src_combo.currentData()
         self.worker.frame_ready.connect(self.on_frame_ready)
-        if enable_ocr:
-            self.worker.ocr_ready.connect(self.on_ocr_ready)
+        self.worker.ocr_ready.connect(self.on_ocr_ready)
         self.worker.start()
-        self.status.setText("Real-time preview started.")
 
-    def stop_worker(self):
-        """
-        Stops the running CaptureWorker if it exists.
-        It calls the worker stop method, clears the reference, and updates the status to show that real time preview is off.
-        """
+    def stop_capture(self) -> None:
+        """Terminates the capture thread."""
         if self.worker:
-            self.worker.stop()
+            try:
+                self.worker.stop()
+            except Exception:
+                pass
             self.worker = None
-        if self.textractor_worker:
-            self.textractor_worker.stop()
-            self.textractor_worker = None
 
-    def on_realtime_changed(self, state):
+    def on_frame_ready(self, pil_img) -> None:
         """
-        Handles the state change of the real time preview checkbox.
-        It starts the capture worker when the box is checked and stops it when the box is unchecked.
+        Slot called every time a new frame is captured.
+        It pairs the latest OCR data with the new image to update the UI overlay.
         """
-        if state == QtCore.Qt.Checked:
-            self.start_worker()
-        else:
-            self.stop_worker()
-            self.status.setText("Real-time preview stopped.")
+        # Build overlay from latest OCR results using cached translations
+        overlay = []
+        src_lang = self.src_combo.currentData()
+        dst_lang = self.dst_combo.currentData()
+        for e in self.latest_ocr:
+            txt = e.get("text")
+            try:
+                # Use translate_signal so we can cache the translation
+                self.translate_signal.emit(src_lang, dst_lang, txt)
+                trans = self.last_translation
+            except Exception:
+                trans = txt
+            overlay.append({"text": txt, "bbox": e.get("bbox"), "translation": trans})
+        self.preview.update_overlay(overlay)
+        self.preview.update_frame(pil_img)
 
-    def on_interval_changed(self, *_):
+    def on_ocr_ready(self, entries: List[Dict[str, Any]]) -> None:
         """
-        Responds to changes in the capture interval spin box.
-        It restarts the capture worker so that the new interval takes effect immediately.
+        Slot called when the OCR worker finishes processing a frame.
+        It repopulates the data table with the new text found.
         """
-        if self.worker:
-            self.start_worker()
+        # When OCR produces new entries, update the table and results
+        self.latest_ocr = entries
+        self.ocr_results = []
+        self.table.setRowCount(0)
+        for e in entries:
+            src_text = e.get("text", "")
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(src_text))
+            # Create a translate button for manual translation
+            btn = QtWidgets.QPushButton("Translate")
+            btn.clicked.connect(lambda checked=False, r=row: self.manual_translate_row(r))
+            self.table.setCellWidget(row, 1, btn)
+            self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(""))
+            bbox_str = str(e.get("bbox", ""))
+            self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(bbox_str))
+            self.ocr_results.append({
+                "text": src_text,
+                "bbox": e.get("bbox"),
+                "lang": e.get("lang", "unknown"),
+                "translation": "",
+            })
 
-    def start_textractor(self):
-        """
-        Starts the text hook worker for the currently attached window using either Win32 PID resolution or a direct id.
-        It constructs a TextractorWorker or Frida based worker, connects its text_ready signal, starts the thread, and updates the status label.
-        """
+    # ---------------------- Hook handling ----------------------
+    def start_hook(self) -> None:
+        """Starts the memory hook thread (LunaWorker)."""
         if not self.attached_hwnd:
-            self.status.setText("No window attached for Textractor.")
             return
-        if self.textractor_worker:
-            self.textractor_worker.stop()
-            self.textractor_worker = None
-        pid = None
-        
-        """pid = get_pid_from_hwnd(self.attached_hwnd)
-        if not pid:
-            self.status.setText("Failed to get process ID for window.")
-            return"""
+        # Stop existing hook worker
+        self.stop_hook()
+        self.hook_worker = LunaWorker(self.attached_hwnd)
+        self.hook_worker.text_ready.connect(self.on_hook_text)
+        self.hook_worker.start()
 
-        if sys.platform.startswith("win"):
-            pid = get_pid_from_hwnd(self.attached_hwnd)
-            if not pid:
-                self.status.setText("Failed to get process ID for window.")
-                return
-            
-            self.textractor_worker = TextractorWorker(pid)
-            self.textractor_worker.text_ready.connect(self.on_hook_text)
-            self.textractor_worker.start()
-            self.status.setText(f"Textractor hook started (PID {pid}).")
-        
-    
-        elif sys.platform.startswith("darwin"):
-            pid = self.attached_hwnd  
-            self.textractor_worker = TextractorWorker(pid)
-            self.textractor_worker.text_ready.connect(self.on_hook_text)
-            self.textractor_worker.start()
-            self.status.setText(f"Frida hook started (PID {pid}).")
-            return
-        
-        else:
-            self.status.setText("Unsupported platform for Textractor.")
-            return
-            
-    def stop_textractor(self):
-        """
-        Stops the active text hook worker if one is running.
-        It calls the worker stop method, clears the reference, and updates the status message so the user sees that hooking has stopped.
-        """
-        if self.textractor_worker:
-            self.textractor_worker.stop()
-            self.textractor_worker = None
-            self.status.setText("Textractor hook stopped.")
+    def stop_hook(self) -> None:
+        """Terminates the memory hook thread."""
+        if self.hook_worker:
+            try:
+                self.hook_worker.stop()
+            except Exception:
+                pass
+            self.hook_worker = None
 
-    def on_hook_mode_changed(self, state):
+    def on_hook_text(self, text: str) -> None:
         """
-        Handles changes to the text hook mode option in the UI.
-        It adjusts internal flags that control whether new text replaces or appends and how it is shown and translated.
+        Slot called when the memory hook retrieves text from the game engine.
+        It translates the text and logs it to the Injection tab.
         """
-        if self.worker:
-            self.start_worker()
-
-        if self.hook_mode_chk.isChecked() and self.attached_hwnd:
-            self.start_textractor()
-        else:
-            self.stop_textractor()
-
-    def on_hook_text(self, text: str):
-        """
-        Receives new text captured from the game hook thread.
-        It adds the text to the display area, may trigger translation, and keeps internal records so translations can be saved or reapplied.
-        """
+        # Called when hook captures new text
         src_lang = self.src_combo.currentData()
         dst_lang = self.dst_combo.currentData()
         try:
             trans = translate_text(src_lang, dst_lang, text)
         except Exception:
             trans = text
-
-        self.hook_last_text = text
-        self.hook_last_translation = trans
-
-        row = self.ocr_table.rowCount()
-        self.ocr_table.insertRow(row)
-        self.ocr_table.setItem(row, 0, QtWidgets.QTableWidgetItem(text))
-        self.ocr_table.setItem(row, 1, QtWidgets.QTableWidgetItem("hook"))
-        self.ocr_table.setItem(row, 2, QtWidgets.QTableWidgetItem(trans))
-        self.ocr_table.setItem(row, 3, QtWidgets.QTableWidgetItem("hook"))
-
+        # Append to injection log
+        timestamp = time.strftime("%H:%M:%S")
+        self.inject_log.appendPlainText(f"[{timestamp}] {text}\n -> {trans}\n")
+        # Add to table
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(text))
+        self.table.setItem(row, 1, QtWidgets.QTableWidgetItem("hook"))
+        self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(trans))
+        self.table.setItem(row, 3, QtWidgets.QTableWidgetItem("hook"))
         self.ocr_results.append({
             "text": text,
             "bbox": (0, 0, 0, 0),
             "lang": "hook",
             "translation": trans,
         })
-        self.status.setText("Hooked line received & translated.")
 
-    def on_frame_ready(self, pil_img):
-        """
-        Receives a new captured frame from the CaptureWorker thread.
-        It forwards the image to the PreviewWidget so the preview updates to the latest game view.
-        """
-        src_lang = self.src_combo.currentData()
-        dst_lang = self.dst_combo.currentData()
+    # ---------------------- Misc UI handlers ----------------------
+    def on_interval_changed(self) -> None:
+        """Restarts capture if the user changes frame rate settings."""
+        # Restart the capture worker with new intervals if running
+        if self.worker:
+            self.start_capture()
 
-        overlay = []
+    def on_row_selected(self, row: int, col: int) -> None:
+        """Highlights the corresponding bounding box in the preview when a table row is clicked."""
+        # Highlight the selected bbox on preview
+        if row < 0 or row >= len(self.ocr_results):
+            return
+        bbox = self.ocr_results[row].get("bbox")
+        self.selected_bbox = bbox
+        self.preview.set_selected_bbox(bbox)
 
-        if self.hook_mode_chk.isChecked() and self.hook_last_translation:
-            w, h = pil_img.size
-            bbox = (int(w * 0.05), int(h * 0.70), int(w * 0.90), int(h * 0.22))
-            overlay.append({
-                "text": self.hook_last_text,
-                "bbox": bbox,
-                "translation": self.hook_last_translation,
-            })
-        else:
-            for e in self.latest_ocr:
-                txt = e["text"]
-                try:
-                    self.translate_signal.emit(src_lang, dst_lang, txt)
-                    trans = self.last_translation
-                except Exception:
-                    trans = txt
-                overlay.append({
-                    "text": txt,
-                    "bbox": e["bbox"],
-                    "translation": trans,
-                })
-
-        self.preview.update_overlay(overlay)
-        self.preview.update_frame(pil_img)
-
-    def on_ocr_ready(self, entries):
-        """
-        Receives OCR results for the current frame.
-        It repopulates the OCR table with new text rows, updates an internal results list, and refreshes the overlay to match.
-        """
-        self.latest_ocr = entries
-        self.ocr_results = []
-        self.ocr_table.setRowCount(0)
-        for e in entries:
-            src = e["text"]
-            row = self.ocr_table.rowCount()
-            self.ocr_table.insertRow(row)
-            self.ocr_table.setItem(row, 0, QtWidgets.QTableWidgetItem(src))
-            self.ocr_table.setItem(row, 1, QtWidgets.QTableWidgetItem(e.get("lang", "unknown")))
-            self.ocr_table.setItem(row, 2, QtWidgets.QTableWidgetItem(""))
-            self.ocr_table.setItem(row, 3, QtWidgets.QTableWidgetItem(str(e["bbox"])))
-            self.ocr_results.append({
-                "text": src,
-                "bbox": e["bbox"],
-                "lang": e.get("lang", "unknown"),
-                "translation": "",
-            })
-
-    def on_select(self):
-        """
-        Handles the user selecting a row in the OCR results table.
-        It loads that row's source text and existing translation into the edit controls so the user can modify or translate it.
-        """
-        idxs = self.ocr_table.selectionModel().selectedRows()
+    def on_select(self) -> None:
+        """Fills the edit box with the current translation when a row is selected."""
+        # Load translation into edit box when row selected
+        idxs = self.table.selectionModel().selectedRows()
         if not idxs:
             return
         r = idxs[0].row()
-        self.edit.setPlainText(self.ocr_results[r].get("translation", ""))
+        text = self.ocr_results[r].get("translation", "")
+        self.edit.setPlainText(text)
 
-    def apply_translation(self):
+    def manual_translate_row(self, row: int) -> None:
+        """Triggers a translation for a specific row via the button."""
+        item = self.table.item(row, 0)
+        if not item:
+            return
+        src_text = item.text()
+        src_lang = self.src_combo.currentData()
+        dst_lang = self.dst_combo.currentData()
+        try:
+            trans = translate_text(src_lang, dst_lang, src_text)
+        except Exception:
+            trans = src_text
+        self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(trans))
+        if 0 <= row < len(self.ocr_results):
+            self.ocr_results[row]["translation"] = trans
+
+    def translate_and_update(self, src: str, dst: str, text: str) -> None:
         """
-        Applies the current translation text to the selected OCR entry.
-        It writes the new translation into the table and internal data structure so the change is reflected in overlays and saved output.
+        Helper method connected to a signal to handle translations.
+        Ensures translations happen on the main thread or are safely cached.
         """
-        idxs = self.ocr_table.selectionModel().selectedRows()
+        # Called via signal from on_frame_ready
+        trans = translate_text(src, dst, text)
+        self.last_translation = trans
+
+    def apply_translation(self) -> None:
+        """Saves the text from the edit box back into the table and results list."""
+        idxs = self.table.selectionModel().selectedRows()
         if not idxs:
             self.status.setText("No selection.")
             return
         r = idxs[0].row()
         text = self.edit.toPlainText().strip()
-        self.ocr_results[r]["translation"] = text
-        self.ocr_table.item(r, 2).setText(text)
+        self.table.setItem(r, 2, QtWidgets.QTableWidgetItem(text))
+        if 0 <= r < len(self.ocr_results):
+            self.ocr_results[r]["translation"] = text
         self.status.setText("Applied translation to selected.")
 
-    def save_translations(self):
-        """
-        Saves all current translations and their metadata to the translations JSON file.
-        It serializes the in memory translation list and writes it to disk so work is preserved between sessions.
-        """
-        with open(TRANSLATION_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.ocr_results, f, ensure_ascii=False, indent=2)
-        self.status.setText(f"Saved translations to {TRANSLATION_FILE}")
+    def save_translations(self) -> None:
+        """Exports the current results to a JSON file."""
+        try:
+            with open(TRANSLATION_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.ocr_results, f, ensure_ascii=False, indent=2)
+            self.status.setText(f"Saved translations to {TRANSLATION_FILE}")
+        except Exception as e:
+            self.status.setText(f"Failed to save translations: {e}")
 
-    def on_src_lang_changed(self, *_):
-        """
-        Handles changes to the source language selection in the UI.
-        It updates internal configuration so future translation requests use the selected source language code.
-        """
+    def choose_text_overlay_color(self) -> None:
+        """Opens a color picker dialog to change the overlay text color."""
+        color = QtWidgets.QColorDialog.getColor(
+            self.preview.text_overlay_color, self, "Choose overlay text color"
+        )
+        if color.isValid():
+            self.preview.setTextColor(color)
+
+    def on_src_lang_changed(self) -> None:
+        """Updates the preferred language for the OCR engine when the combo box changes."""
+        # Update OCR preferred language
         if self.worker:
-            self.start_worker()
+            self.worker.prefer_lang = self.src_combo.currentData()
 
-    def closeEvent(self, e):
-        """
-        Intercepts the window close event to perform cleanup.
-        It stops capture and hook workers if they are running and then delegates to the base class closeEvent implementation.
-        """
-        self.stop_worker()
-        return super().closeEvent(e)
+    def show_help(self) -> None:
+        """Displays a help dialog with instructions."""
+        msg = (
+            "<b>Game Translation Tool (OCR & Luna Hook)</b><br><br>"
+            "<b>Workflow:</b><br>"
+            "1. Use <i>Refresh Windows</i> to populate the list of open windows.<br>"
+            "2. Select a game window.<br>"
+            "3. Choose either the OCR or Injection tab.<br>"
+            "   - In OCR mode: Click <i>Attach</i> to start live capture, OCR and overlay translation.<br>"
+            "   - In Injection mode: Click <i>Attach</i> to start the Luna hook.  You must have"
+            "     placed Luna's DLLs and injected the hook into the process separately.<br>"
+            "4. Use the language selectors to choose source and target languages.<br>"
+            "5. Click table rows to edit translations manually, then click <i>Apply</i> and"
+            "   <i>Save</i> to persist them.<br>"
+            "<br>"
+            "Note: The injection mode depends on native binaries that are not included in this"
+            " repository.  Without them the hook will produce no output."
+        )
+        QtWidgets.QMessageBox.information(self, "Help", msg)
 
-    def translate_and_update(self, src, dst, txt):
-        """
-        Translates the given text from the specified source language to the destination language.
-        It calls translate_text, stores the result in last_translation, and leaves it ready for insertion into the UI or data structures.
-        """
-        trans = translate_text(src, dst, txt)
-        self.last_translation = trans
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        """Handles application closure, ensuring all threads are stopped gracefully."""
+        # Clean up threads on exit
+        self.stop_capture()
+        self.stop_hook()
+        super().closeEvent(event)
+
+
+
+def main() -> None:
+    app = QtWidgets.QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    app = QtWidgets.QApplication(sys.argv)
-    w = MainWindow()
-    w.show()
-    sys.exit(app.exec())
+    main()

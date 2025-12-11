@@ -1,111 +1,88 @@
-import os
-import sys
-import time
-import subprocess
-import ctypes
-
+import frida
 from PySide6 import QtCore
+import sys
 
-APP_DIR = os.path.dirname(__file__)
-TEXTRACTOR_CLI_PATH = os.path.join(APP_DIR, "TextractorCLI.exe")
+# Check if we are on Windows to import specific libraries
+if sys.platform.startswith("win32"):
+    import win32gui
+    import win32process
 
-
-def get_pid_from_hwnd(hwnd: int) -> int:
-    """Return process ID for a given window handle (HWND)."""
-    if sys.platform == "win32":
-        import ctypes
-        pid = ctypes.c_ulong()
-        ctypes.windll.user32.GetWindowThreadProcessId(
-            ctypes.c_void_p(hwnd),
-            ctypes.byref(pid)
-    )
-        return pid.value
-    elif sys.platform == "darwin":
-            # macOS implementation (not implemented here)
-            print("[TEXTRACTOR] get_pid_from_hwnd not implemented on macOS")
+def get_pid_from_hwnd(hwnd):
+    """
+    Retrieves the Process ID (PID) given a Window Handle (HWND).
+    This function is crucial for linking the GUI window to the system process.
+    """
+    if not hwnd:
+        return None
+        
+    # Only Windows supports HWND -> PID conversion via win32process
+    if sys.platform.startswith("win32"):
+        try:
+            # Principle: GetWindowThreadProcessId returns a tuple (thread_id, process_id).
+            # We only need the process_id (the second element).
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            return pid
+        except Exception as e:
+            print(f"Error getting PID from HWND: {e}")
             return None
-    else:
-            return None
+    
+    # Fallback for non-Windows systems (though LunaHook is Windows only)
+    return None
+
 
 class TextractorWorker(QtCore.QThread):
-    """Runs TextractorCLI.exe, attaches to a process, emits hooked text lines."""
-
+    # Runs Frida to hook text rendering functions, emits hooked text lines.
     text_ready = QtCore.Signal(str)
-
-    def __init__(self, pid: int, cli_path: str = TEXTRACTOR_CLI_PATH, parent=None):
+    
+    def __init__(self, pid: int, parent=None):
         super().__init__(parent)
         self.pid = pid
-        self.cli_path = cli_path
-        self._proc = None
+        self.session = None
+        self.script = None
         self._running = False
-
+    
     def run(self):
-        if not os.path.isfile(self.cli_path):
-            print("[TEXTRACTOR] CLI not found at", self.cli_path)
-            return
-
-        try:
-            self._proc = subprocess.Popen(
-                [self.cli_path],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                encoding="utf-16-le",
-                errors="ignore",
-                bufsize=1,
-            )
-        except Exception as e:
-            print("[TEXTRACTOR] Failed to start CLI:", e)
-            return
-
         self._running = True
-
+#start frida session and script
         try:
-            cmd = f"attach -P{self.pid}\n"
-            self._proc.stdin.write(cmd)
-            self._proc.stdin.flush()
+            self._session = frida.attach(self.pid)
+            js = """
+            // Frida JavaScript code to hook text rendering functions
+            // This is a placeholder; actual implementation depends on the target application
+            rpc.exports = {
+                // Exported functions can be defined here
+            };
+            """
+            
+            self._script = self._session.create_script(js)
+            self._script.on("message", self.on_message)
+            self._script.load()
+            
         except Exception as e:
-            print("[TEXTRACTOR] Failed to send attach command:", e)
-            self._running = False
+            print("[FRIDA] Failed to start CLI:", e)
+            return
 
-        for line in self._proc.stdout:
-            if not self._running:
-                break
-            line = line.strip()
-            if not line:
-                continue
-
-            if "] " in line:
-                try:
-                    _, text = line.split("] ", 1)
-                except ValueError:
-                    text = line
-            else:
-                text = line
-
-            text = text.strip()
-            if len(text) < 2:
-                continue
-
+        while self._running:
+            QtCore.QThread.msleep(100)
+            
+#handle messages from frida script
+    def on_message(self, message, data):
+        if message['type'] == 'send':
+            text = message['payload']
             self.text_ready.emit(text)
-
-        try:
-            if self._proc and self._proc.poll() is None:
-                self._proc.terminate()
-        except Exception:
-            pass
-
+            
+#stop the frida session and script
     def stop(self):
         self._running = False
-        if self._proc and self._proc.poll() is None:
-            try:
-                cmd = f"detach -P{self.pid}\n"
-                self._proc.stdin.write(cmd)
-                self._proc.stdin.flush()
-                time.sleep(0.2)
-                self._proc.terminate()
-            except Exception:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
+        
+        try:
+            if self._script:
+                    self._script.unload()
+            if self._session:
+                    self._session.detach()
+        except Exception:
+                pass
+        try:
+            self.wait()
+        except Exception:
+                pass

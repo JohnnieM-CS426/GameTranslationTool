@@ -1,17 +1,16 @@
-
 from PIL import ImageGrab, Image
 import sys
 import numpy as np
 
-#For Windows and Mac software
+# For Windows and Mac software
 WINDOWS = sys.platform.startswith("win32")
 MAC = sys.platform.startswith("darwin")
 
-#windows imports
+# windows imports
 if WINDOWS:
     import win32gui
     
-#mac imports
+# mac imports
 if MAC:
     from Quartz import (
         CGWindowListCopyWindowInfo,
@@ -24,38 +23,38 @@ if MAC:
     import Quartz
     
 class WindowLister:
+    """
+    A helper class to list windows.
+    This duplicates functionality from capture.py but serves as a simplified standalone version.
+    """
     @staticmethod
     def list_windows():
         """
-        Enumerates all top level windows and builds a list usable by the UI.
-        It uses Win32 enumeration or platform calls to gather window handles and titles into a global collection.
+        Lists windows based on the OS.
+        Uses EnumWindows on Windows and Quartz window lists on Mac.
         """
         if WINDOWS:   
             wins = []
             def enum(hwnd, ctx):
-                """
-                Callback used by EnumWindows to handle each discovered window.
-                It filters based on visibility and non empty titles and stores accepted windows in the provided context.
-                """
                 if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd):
                     wins.append((hwnd, win32gui.GetWindowText(hwnd)))
             win32gui.EnumWindows(enum, None)
             return wins
         if MAC:
-        #get all window info
+        # get all window info
             windowInfo = CGWindowListCopyWindowInfo(
             kCGWindowListOptionOnScreenOnly,
             kCGNullWindowID
         )
             out = []
         
-        #loop through the windows and get the id,name and title of the window
+        # loop through the windows and get the id,name and title of the window
             for w in windowInfo:
                 windowID = w.get("kCGWindowNumber")
                 owner = w.get("kCGWindowOwnerName", " ")
                 name = w.get("kCGWindowName", " ")
         
-        #filter to keep visible windows only
+        # filter to keep visible windows only
                 if windowID and (owner or name):
                     out.append((windowID, f"{owner} - {name}"))
         
@@ -65,8 +64,8 @@ class WindowLister:
 
 def get_window_rect(hwnd):
     """
-    Gets the bounding rectangle of the specified window in screen coordinates.
-    It calls the underlying system API to query the position and size and returns them as a tuple.
+    Gets the window geometry.
+    It attempts to get the client rect (content only) first, falling back to window rect (with borders).
     """
     try:
         rect = win32gui.GetClientRect(hwnd)
@@ -84,20 +83,21 @@ def get_window_rect(hwnd):
 
 def capture_window_image(hwnd):
     """
-    Captures a screenshot of the given window or full screen depending on the platform.
-    It uses GDI or Quartz to obtain pixel data, reshapes it into an array, and returns it as a PIL image.
+    Captures an image of the window using high-level APIs.
+    Uses PIL ImageGrab on Windows (simpler than BitBlt) and CGWindowListCreateImage on Mac.
     """
     if WINDOWS:
         coords = get_window_rect(hwnd)
         if not coords:
             return None
         
+        # Principle: ImageGrab takes a bounding box and captures that region of the desktop.
         left, top, right, bottom = coords
         img = ImageGrab.grab(bbox=(left, top, right, bottom))
         return img.convert("RGB")
 
     if MAC:
-        #capture window image and return nothing if failure occurs
+        # capture window image and return nothing if failure occurs
         imageRef = CGWindowListCreateImage(
             Quartz.CGRectNull,
             kCGWindowListOptionIncludingWindow,
@@ -108,7 +108,7 @@ def capture_window_image(hwnd):
         if imageRef is None:
             return None
         
-        #get the width and height and pixel data of the image
+        # get the width and height and pixel data of the image
         width = Quartz.CGImageGetWidth(imageRef)
         height = Quartz.CGImageGetHeight(imageRef)
         
@@ -116,7 +116,7 @@ def capture_window_image(hwnd):
             Quartz.CGImageGetDataProvider(imageRef)
         )
         
-        #convert from raw data to pil image
+        # convert from raw data to pil image
         npArray = np.frombuffer(pixData, dtype = np.uint8).reshape((height,width,5))
         
         return Image.fromarray(npArray, "RGBA")
