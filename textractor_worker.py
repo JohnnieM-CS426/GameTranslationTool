@@ -38,6 +38,9 @@ class TextractorWorker(QtCore.QThread):
         self.cli_path = cli_path
         self._proc = None
         self._running = False
+        self._last_text = None
+        self._last_emit_time = 0.0
+        self._min_interval = 0.25
 
     def run(self):
         if not os.path.isfile(self.cli_path):
@@ -94,7 +97,26 @@ class TextractorWorker(QtCore.QThread):
                 self._proc.terminate()
         except Exception:
             pass
+    
+    def should_emit(self, text):
+        """
+        Boolean determines if text is needed or must be emitted
+        """
+        now = time.time()
 
+        # Normalize text
+        norm = text.strip()
+
+        if norm == self._last_text:
+            return False
+
+        if now - self._last_emit_time < self._min_interval:
+            return False
+
+        self._last_text = norm
+        self._last_emit_time = now
+        return True
+    
     def stop(self):
         self._running = False
         if self._proc and self._proc.poll() is None:
