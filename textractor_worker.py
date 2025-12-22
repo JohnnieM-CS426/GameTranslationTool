@@ -89,6 +89,8 @@ class TextractorWorker(QtCore.QThread):
             text = text.strip()
             if len(text) < 2:
                 continue
+            if not self.should_emit(text):
+                continue
 
             self.text_ready.emit(text)
 
