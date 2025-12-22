@@ -122,3 +122,7 @@ def capture_window_image(hwnd):
         return Image.fromarray(npArray, "RGBA")
     
     return None
+
+def check_version():
+    if not WINDOWS and not MAC:
+        exit(0)

@@ -74,3 +74,5 @@ def ocr_image_data(pil_image, prefer_lang_code="auto"):
         })
 
     return entries
+
+
