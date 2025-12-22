@@ -87,6 +87,7 @@ def capture_window_image(hwnd):
     Captures a screenshot of the given window or full screen depending on the platform.
     It uses GDI or Quartz to obtain pixel data, reshapes it into an array, and returns it as a PIL image.
     """
+    check_version()
     if WINDOWS:
         coords = get_window_rect(hwnd)
         if not coords:
@@ -124,5 +125,7 @@ def capture_window_image(hwnd):
     return None
 
 def check_version():
+    """Check to see if platform is supported within our software"""
     if not WINDOWS and not MAC:
+        print("Operating System unsupported")
         exit(0)
