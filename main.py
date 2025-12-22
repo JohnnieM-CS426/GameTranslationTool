@@ -597,6 +597,8 @@ class MainWindow(QtWidgets.QWidget):
         with open(TRANSLATION_FILE, "w", encoding="utf-8") as f:
             json.dump(self.ocr_results, f, ensure_ascii=False, indent=2)
         self.status.setText(f"Saved translations to {TRANSLATION_FILE}")
+    
+    
 
     def on_src_lang_changed(self, *_):
         """
