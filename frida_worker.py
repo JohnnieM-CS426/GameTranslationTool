@@ -2,8 +2,17 @@ import frida
 from PySide6 import QtCore
 
 
+<<<<<<< Updated upstream
 class TextractorWorker(QtCore.QThread):
     #Runs Frida to hook text rendering functions, emits hooked text lines.
+=======
+class FridaWorker(QtCore.QThread):
+    """
+    A worker thread that uses Frida for dynamic instrumentation.
+    Frida allows injecting JavaScript into a running process to hook function calls (like text rendering).
+    """
+    # Runs Frida to hook text rendering functions, emits hooked text lines.
+>>>>>>> Stashed changes
     text_ready = QtCore.Signal(str)
     
     def __init__(self, pid: int, parent=None):
