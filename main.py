@@ -511,12 +511,16 @@ class MainWindow(QtWidgets.QWidget):
             "translation": "",
         })
 
+<<<<<<< HEAD
         self.translator.translate_async(
             src_lang,
             dst_lang,
             text,
             tag={"type": "hook", "row": row, "ts": timestamp},
         )
+=======
+        self.translator.translate_async(src_lang, dst_lang, text, tag={"type": "hook", "row": row})
+>>>>>>> bbf9db4 (Add Luna hook backend and improve capture/translation)
 
     def on_hook_status(self, message: str) -> None:
         self.status.setText(message)
@@ -664,4 +668,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+<<<<<<< HEAD
     main()
+=======
+    main()
+>>>>>>> bbf9db4 (Add Luna hook backend and improve capture/translation)
