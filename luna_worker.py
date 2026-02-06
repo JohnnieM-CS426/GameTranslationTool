@@ -190,6 +190,11 @@ class LunaHookWorker(QtCore.QThread):
         self._helper_mode = False
         self._target_bit: Optional[str] = None
         self._safe_mode = os.environ.get("LUNA_SAFE_MODE") == "1"
+        env_auto_pc_hooks = os.environ.get("LUNA_AUTO_PC_HOOKS")
+        if env_auto_pc_hooks is not None:
+            self._auto_pc_hooks = env_auto_pc_hooks == "1"
+        if self._safe_mode:
+            self._auto_pc_hooks = False
 
     def run(self) -> None:
         self._running = True
@@ -202,9 +207,18 @@ class LunaHookWorker(QtCore.QThread):
             if not target_bit:
                 return
             self._target_bit = target_bit
-            use_helper = os.environ.get("LUNA_USE_HELPER32") == "1"
-            if use_helper and target_bit == "32" and sys.maxsize > 2**32:
-                if not self._start_helper32(pid, target_bit):
+            if target_bit == "32" and sys.maxsize > 2**32:
+                use_helper_env = os.environ.get("LUNA_USE_HELPER32")
+                if use_helper_env == "0":
+                    self.status.emit("Target is 32-bit. 64-bit runtime requires helper. Set LUNA_USE_HELPER32=1.")
+                    return
+                python32 = _find_python32()
+                if not python32:
+                    self.status.emit("Target is 32-bit. Set PYTHON32_EXE to a 32-bit Python path.")
+                    self.status.emit("Example: PYTHON32_EXE=C:\\Python310-32\\python.exe")
+                    return
+                self.status.emit("Auto enabled 32-bit helper for 32-bit target.")
+                if not self._start_helper32(pid, target_bit, python32=python32):
                     return
                 self._helper_mode = True
                 self.status.emit(f"Luna 32-bit helper attached (PID {pid}). Waiting for text...")
@@ -285,8 +299,8 @@ class LunaHookWorker(QtCore.QThread):
         target_bit = "64" if is64 else "32"
         return target_bit
 
-    def _start_helper32(self, pid: int, target_bit: str) -> bool:
-        python32 = _find_python32()
+    def _start_helper32(self, pid: int, target_bit: str, *, python32: Optional[str] = None) -> bool:
+        python32 = python32 or _find_python32()
         if not python32:
             self.status.emit("Target is 32-bit. Set PYTHON32_EXE to a 32-bit Python path.")
             self.status.emit("Example: PYTHON32_EXE=C:\\Python310-32\\python.exe")
@@ -313,12 +327,17 @@ class LunaHookWorker(QtCore.QThread):
             str(int(self._flush_delay * 1000)),
         ]
         env = os.environ.copy()
+        env = os.environ.copy()
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
         self._helper_proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             env=env,
         )
@@ -477,6 +496,9 @@ class LunaHookWorker(QtCore.QThread):
                 self.status.emit(err)
             if ret == 0:
                 self.status.emit("Injected LunaHook DLL.")
+                return
+            if os.environ.get("LUNA_NO_ELEVATE") == "1":
+                self.status.emit("DLL injection failed, skipping elevation (LUNA_NO_ELEVATE=1).")
                 return
             self.status.emit("DLL injection failed, trying elevated injection...")
             ctypes.windll.shell32.ShellExecuteW(None, "runas", proxy, f'dllinject {pid} "{hook}"', None, 0)

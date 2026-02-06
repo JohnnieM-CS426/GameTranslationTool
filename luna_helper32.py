@@ -5,6 +5,7 @@ import ctypes
 import json
 import os
 import re
+import io
 import subprocess
 import sys
 import threading
@@ -31,6 +32,19 @@ def _emit_status(message: str) -> None:
 
 def _emit_text(text: str) -> None:
     print(json.dumps({"type": "text", "text": text}, ensure_ascii=False), flush=True)
+
+
+def _configure_stdout() -> None:
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            return
+    except Exception:
+        pass
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
+    except Exception:
+        pass
 
 
 def _open_process(pid: int):
@@ -78,6 +92,9 @@ def _find_luna_root(target_bit: str) -> Path:
     if env_root:
         return Path(env_root).expanduser()
     base = Path(__file__).resolve().parent
+    dedicated = base / "LunaHook"
+    if (dedicated / "files").exists():
+        return dedicated
     if target_bit == "32":
         candidates = [
             base / "LunaTranslator_x86_win7",
@@ -121,14 +138,34 @@ def _clean_text(text: str) -> str:
     return text.strip()
 
 
+def _is_noise(text: str) -> bool:
+    if not text:
+        return True
+    lower = text.lower()
+    if "kernel32.dll" in lower or "user32.dll" in lower or "gdi32.dll" in lower:
+        return True
+    if "driverstore" in lower or "nvldumd" in lower or "nvfbc" in lower:
+        return True
+    if "d3d" in lower or "d3dx" in lower:
+        return True
+    if "\\windows\\" in lower and ".dll" in lower:
+        return True
+    if ".dll" in lower and len(text) > 60:
+        return True
+    if len(text) > 1000 and not re.search(r"[\u3040-\u30ff\u3400-\u9fff]", text):
+        return True
+    return False
+
+
 def main() -> int:
+    _configure_stdout()
     parser = argparse.ArgumentParser()
     parser.add_argument("--pid", type=int, required=True)
     parser.add_argument("--codepage", type=int, default=932)
     parser.add_argument("--text-thread-delay", type=int, default=500)
     parser.add_argument("--max-buffer-size", type=int, default=3000)
     parser.add_argument("--max-history-size", type=int, default=1000000)
-    parser.add_argument("--auto-pc-hooks", action="store_true", default=True)
+    parser.add_argument("--auto-pc-hooks", action="store_true", default=False)
     parser.add_argument("--flush-delay-ms", type=int, default=120)
     args = parser.parse_args()
 
@@ -164,6 +201,8 @@ def main() -> int:
     last_emitted: Dict[Tuple[int, int, int, int], str] = {}
     pending_lock = threading.Lock()
     flush_delay = max(10, int(args.flush_delay_ms)) / 1000.0
+    recent_texts: Dict[str, float] = {}
+    recent_window = 1.2
 
     def flush_loop():
         while not stop_event.is_set():
@@ -176,8 +215,14 @@ def main() -> int:
                     last = last_emitted.get(key)
                     if text and text != last:
                         last_emitted[key] = text
-                        emit_list.append(text)
+                        last_seen = recent_texts.get(text)
+                        if last_seen is None or (now - last_seen) >= recent_window:
+                            recent_texts[text] = now
+                            emit_list.append(text)
                     pending.pop(key, None)
+                for t, tstamp in list(recent_texts.items()):
+                    if now - tstamp > 5.0:
+                        recent_texts.pop(t, None)
             for text in emit_list:
                 _emit_text(text)
             time.sleep(0.05)
@@ -215,13 +260,21 @@ def main() -> int:
         luna.Luna_AllocString.argtypes = (c_wchar_p,)
         luna.Luna_AllocString.restype = c_void_p
 
+    def _insert_pc_hooks(pid_):
+        time.sleep(0.6)
+        try:
+            hook_ids = [0]
+            if os.environ.get("LUNA_PC_HOOKS_BOTH") == "1":
+                hook_ids.append(1)
+            for hook_id in hook_ids:
+                luna.Luna_InsertPCHooks(pid_, hook_id)
+                time.sleep(0.1)
+        except Exception:
+            pass
+
     def on_proc_connect(pid_):
         if args.auto_pc_hooks:
-            try:
-                luna.Luna_InsertPCHooks(pid_, 0)
-                luna.Luna_InsertPCHooks(pid_, 1)
-            except Exception:
-                pass
+            threading.Thread(target=_insert_pc_hooks, args=(pid_,), daemon=True).start()
         _emit_status(f"Process connected: {pid_}")
 
     def on_proc_remove(pid_):
@@ -238,7 +291,7 @@ def main() -> int:
 
     def on_output(hc, hn, tp, output):
         text = _clean_text(output)
-        if not text:
+        if not text or _is_noise(text):
             return
         key = (int(tp.processId), int(tp.addr), int(tp.ctx), int(tp.ctx2))
         with pending_lock:
