@@ -609,8 +609,10 @@ class MainWindow(QtWidgets.QWidget):
         self.snipper.show()
 
     def on_snip(self, img):
-        self.data = ocr_image_data(img, self.src_combo.currentData())
-        self.on_ocr_ready(self.data)
+        data, processed_img = ocr_image_data(img, self.src_combo.currentData())
+        self.on_ocr_ready(data)
+        self.image_window = ImageWindow(img, processed_img)
+        self.image_window.show()
 
     # ---------------------- Hook handling ----------------------
     def start_hook(self) -> None:
@@ -1092,6 +1094,36 @@ class SettingsWindow(QtWidgets.QWidget):
     def closeEvent(self, event) -> None:
         self.on_cancel()
         event.accept()
+
+
+"""Window that appears after applying Manual OCR for debug purposes"""
+class ImageWindow(QtWidgets.QWidget):
+    def __init__(self, img1, img2):
+        super().__init__()
+        self.setWindowTitle("Manual OCR")
+
+        qt_img1 = img1.toqpixmap()
+        qt_img2 = img2.toqpixmap()
+
+        label1 = QtWidgets.QLabel()
+        label1.setPixmap(qt_img1)
+        label1_name = QtWidgets.QLabel("Original")
+        label2 = QtWidgets.QLabel()
+        label2.setPixmap(qt_img2)
+        label2_name = QtWidgets.QLabel("Processed")
+
+        col1 = QtWidgets.QVBoxLayout()
+        col1.addWidget(label1_name)
+        col1.addWidget(label1)
+
+        col2 = QtWidgets.QVBoxLayout()
+        col2.addWidget(label2_name)
+        col2.addWidget(label2)
+
+        layout = QtWidgets.QHBoxLayout()
+        layout.addLayout(col1)
+        layout.addLayout(col2)
+        self.setLayout(layout)
 
 def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
